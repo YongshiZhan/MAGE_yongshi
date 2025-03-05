@@ -8,9 +8,9 @@ from llama_index.core.llms import LLM
 
 from .log_utils import get_logger, set_log_dir, switch_log_to_file, switch_log_to_stdout
 from .rtl_editor import RTLEditor
-from .rtl_generator import RTLGenerator
+from .rtl_generator import RTLGenerator, WrongRTLGen
 from .sim_judge import SimJudge
-from .sim_reviewer import SimReviewer
+from .sim_reviewer import SimReviewer, sim_review_golden
 from .tb_generator import TBGenerator
 from .token_counter import TokenCounter, TokenCounterCached
 
@@ -26,7 +26,7 @@ class TopAgent:
             else TokenCounter(llm)
         )
         self.sim_max_retry = 4
-        self.rtl_max_candidates = 20
+        self.rtl_max_candidates = 5
         self.rtl_selected_candidates = 2
         self.is_ablation = False
         self.redirect_log = False
@@ -289,3 +289,231 @@ class TopAgent:
             with open(f"{log_dir_per_run}/mage_rtl_rich_free.log", "w") as f:
                 f.write(content)
         return result
+
+class TopAgent_WrongRTL(TopAgent):
+    def run_instance(self, spec: str) -> Tuple[bool, str]:
+        """
+        Run a single instance of the benchmark
+        Return value:
+        - is_pass: bool, whether the instance passes the golden testbench
+        - rtl_code: str, the generated RTL code
+        """
+        assert self.tb_gen
+        assert self.rtl_gen
+        assert self.sim_reviewer
+        assert self.sim_judge
+        assert self.rtl_edit
+
+        self.rtl_gen = WrongRTLGen(self.token_counter)
+        self.tb_gen.reset()
+        self.tb_gen.set_golden_tb_path(self.golden_tb_path)
+        if not self.golden_tb_path:
+            logger.info("No golden testbench provided")
+        testbench, interface = self.tb_gen.chat(spec)
+        logger.info("Initial tb:")
+        logger.info(testbench)
+        logger.info("Initial if:")
+        logger.info(interface) #这个interface怎么办
+        self.write_output(testbench, "tb.sv")
+        self.write_output(interface, "if.sv")
+        self.rtl_gen.reset()
+
+        with open(self.golden_tb_path, "r") as tb:
+            testbench = tb.read()
+        logger.info(testbench)
+        logger.info(spec)
+
+        is_syntax_pass, rtl_code = self.rtl_gen.chat(
+            input_spec=spec,
+            testbench=testbench,
+            interface=interface,
+            rtl_path=os.path.join(self.output_dir_per_run, "rtl.sv"),
+        )
+        if not is_syntax_pass:
+            return False, rtl_code
+        self.write_output(rtl_code, "rtl.sv")
+        logger.info("Initial rtl:")
+        logger.info(rtl_code)
+
+        tb_need_fix = False
+        rtl_need_fix = True
+        sim_log = ""
+        is_sim_pass, sim_mismatch_cnt, sim_log = self.sim_reviewer.review()
+        # commented out because want to generate 5 examples
+        # if not is_sim_pass:
+        #     tb_need_fix = False
+        #     rtl_need_fix = False
+                
+        """ for i in range(self.sim_max_retry):
+            # run simulation judge, overwrite is_sim_pass
+            is_sim_pass, sim_mismatch_cnt, sim_log = self.sim_reviewer.review()
+            if not is_sim_pass:
+                tb_need_fix = False
+                rtl_need_fix = False
+                break
+            self.sim_judge.reset()
+            tb_need_fix = self.sim_judge.chat(spec, sim_log, rtl_code, testbench)
+            if tb_need_fix:
+                self.tb_gen.reset()
+                if i == 0:
+                    self.tb_gen.gen_display_queue = False
+                    logger.info("Fallback from display queue to display moment")
+                else:
+                    self.tb_gen.set_failed_trial(sim_log, rtl_code, testbench)
+
+                testbench, _ = self.tb_gen.chat(spec)
+                self.write_output(testbench, "tb.sv")
+                logger.info("Revised tb:")
+                logger.info(testbench)
+            else:
+                break """
+        candidates_info: List[Tuple[str, int, str]] = []
+        self.rtl_gen.reset()
+            
+        candidates = []
+        candidates += self.rtl_gen.gen_candidates(
+                input_spec=spec,
+                testbench=testbench,
+                interface=interface,
+                rtl_path=os.path.join(self.output_dir_per_run, "rtl.sv"),
+                candidates_num=self.rtl_max_candidates,
+                enable_cache=True,
+            )
+        
+        candidate_list = []
+        
+        for i in range(self.rtl_max_candidates):
+            logger.info(
+                f"Candidate generation: round {i + 1} / {self.rtl_max_candidates}"
+            )
+            is_syntax_pass_candiate, rtl_code_candidate = candidates[i]
+            if not is_syntax_pass_candiate:
+                continue
+            self.write_output(rtl_code_candidate, "rtl.sv")
+            is_sim_pass_candidate, sim_mismatch_cnt_candidate, sim_log_candidate = (
+                self.sim_reviewer.review()
+            )
+            if not is_sim_pass_candidate:
+                rtl_code = rtl_code_candidate
+                sim_mismatch_cnt = sim_mismatch_cnt_candidate
+                sim_log = sim_log_candidate
+                rtl_need_fix = False
+                if rtl_code not in candidate_list:
+                    candidate_list += [rtl_code]
+                    
+            candidates_info.append(
+                (rtl_code_candidate, sim_mismatch_cnt_candidate, sim_log_candidate)
+            )
+
+            if len(candidate_list) >= 5:
+                break
+        wrong_rtl_5_exp = ""
+        for i in range(len(candidate_list)):
+            wrong_rtl_5_exp += f"Example {i + 1}:\n" + candidate_list[i] + "\n\n\n"
+        logger.info("5 Wrong RTL examples:\n" + wrong_rtl_5_exp)
+        with open(f"{self.output_dir_per_run}/wrong_rtl_5_exp.sv", "w") as f:
+            f.write(wrong_rtl_5_exp)
+
+        assert not tb_need_fix, f"tb_need_fix should be False. sim_log: {sim_log}"
+
+        # candidates_info: List[Tuple[str, int, str]] = []
+        # if rtl_need_fix:
+        #     # Candidates Generation
+        #     assert (
+        #         sim_mismatch_cnt <= 0
+        #     ), f"rtl_need_fix should be True only when sim_mismatch_cnt <= 0. sim_log: {sim_log}"
+        #     self.rtl_gen.reset()
+        #     """ candidates = [
+        #         self.rtl_gen.chat(
+        #             input_spec=spec,
+        #             testbench=testbench,
+        #             interface=interface,
+        #             rtl_path=os.path.join(self.output_dir_per_run, "rtl.sv"),
+        #             enable_cache=True,
+        #         )
+        #     ]  # Write Cache
+        #     if self.rtl_max_candidates > 1:
+        #         candidates += self.rtl_gen.gen_candidates(
+        #             input_spec=spec,
+        #             testbench=testbench,
+        #             interface=interface,
+        #             rtl_path=os.path.join(self.output_dir_per_run, "rtl.sv"),
+        #             candidates_num=self.rtl_max_candidates - 1,
+        #             enable_cache=True,
+        #         ) """
+        #     candidates = []
+        #     candidates += self.rtl_gen.gen_candidates(
+        #             input_spec=spec,
+        #             testbench=testbench,
+        #             interface=interface,
+        #             rtl_path=os.path.join(self.output_dir_per_run, "rtl.sv"),
+        #             candidates_num=self.rtl_max_candidates,
+        #             enable_cache=True,
+        #         )
+        #     print("generate candidates")
+        #     candidate_list = []
+        #     print("generate list of candidates")
+        #     for i in range(self.rtl_max_candidates):
+        #         logger.info(
+        #             f"Candidate generation: round {i + 1} / {self.rtl_max_candidates}"
+        #         )
+        #         is_syntax_pass_candiate, rtl_code_candidate = candidates[i]
+        #         if not is_syntax_pass_candiate:
+        #             continue
+        #         self.write_output(rtl_code_candidate, "rtl.sv")
+        #         is_sim_pass_candidate, sim_mismatch_cnt_candidate, sim_log_candidate = (
+        #             self.sim_reviewer.review()
+        #         )
+        #         if not is_sim_pass_candidate:
+        #             rtl_code = rtl_code_candidate
+        #             sim_mismatch_cnt = sim_mismatch_cnt_candidate
+        #             sim_log = sim_log_candidate
+        #             rtl_need_fix = False
+        #             if rtl_code not in candidate_list:
+        #                 candidate_list += [rtl_code]
+                    
+        #         candidates_info.append(
+        #             (rtl_code_candidate, sim_mismatch_cnt_candidate, sim_log_candidate)
+        #         )
+
+        #         if len(candidate_list) >= 5:
+        #             break
+        #     wrong_rtl_5_exp = ""
+        #     for i in len(candidate_list):
+        #         wrong_rtl_5_exp += f"Example {i + 1}:\n" + candidate_list[i] + "\n\n\n"
+        #     with open(f"{self.output_dir_per_run}/wrong_rtl_5_exp.sv", "w") as f:
+        #         f.write(rtl_code)
+
+        # candidates_info.sort(key=lambda x: x[1])
+        # candidates_info_unique_sign = set()
+        # candidates_info_unique = []
+        # for candidate in candidates_info:
+        #     if candidate[1] not in candidates_info_unique_sign:
+        #         candidates_info_unique_sign.add(candidate[1])
+        #         candidates_info_unique.append(candidate)
+
+        # if rtl_need_fix:
+        #     # Editor iteration
+        #     for i in range(self.rtl_selected_candidates):
+        #         logger.info(
+        #             f"Selected candidate: round {i + 1} / {self.rtl_selected_candidates}"
+        #         )
+        #         i = i % len(candidates_info_unique)
+        #         rtl_code, sim_mismatch_cnt, sim_log = candidates_info_unique[i]
+        #         with open(f"{self.output_dir_per_run}/rtl.sv", "w") as f:
+        #             f.write(rtl_code)
+        #         self.rtl_edit.reset()
+        #         is_sim_pass, rtl_code = self.rtl_edit.chat(
+        #             spec=spec,
+        #             output_dir_per_run=self.output_dir_per_run,
+        #             sim_failed_log=sim_log,
+        #             sim_mismatch_cnt=sim_mismatch_cnt,
+        #         )
+        #         if not is_sim_pass:
+        #             rtl_need_fix = False
+        #             break
+
+        if is_sim_pass:  # Run if keep failing before last try
+            is_sim_pass, _, _ = self.sim_reviewer.review()
+
+        return is_sim_pass, rtl_code

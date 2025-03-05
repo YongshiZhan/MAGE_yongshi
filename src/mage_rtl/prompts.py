@@ -623,3 +623,98 @@ So, please STRICTLY FOLLOW the output format given as XML tag content below to g
 </output_format>
 DO NOT include any other information in your response, like 'json', 'reasoning' or '<output_format>'.
 """
+
+WRONG_RTL_2_SHOT_EXAMPLES = """
+Here is an example of RTL SystemVerilog code with functional error:
+Example 1:
+<example>
+    <input_spec>
+        Implement the SystemVerilog module based on the following description.
+        Assume that sigals are positive clock/clk triggered unless otherwise stated.
+
+        The module should implement a XOR gate.
+    </input_spec>
+    <module>
+        module TopModule(
+            input  logic in0,
+            input  logic in1,
+            output logic out
+        );
+
+            assign out = in0 | in1;
+
+        endmodule
+    </module>
+</example>
+Example 2:
+<example>
+    <input_spec>
+        ECE-111 Advanced Digital Design Projects 
+            Develop SystemVerilog RTL model for Programmable N-bit Rate ½ Convolutional Encoder :
+            •	Length should be parameterized, to allow any number; in practice, we’ll confine to 3 to 9 
+            •	In the SystemVerilog module implement a rate ½ structure for any constraint length value, N
+            •	You will need two reduction XORs and two bitwise ANDs
+            o	hint: you may wish to adapt your design from my programmable LFSR
+            •	Synthesize and simulate using conv. enc. testbench provided 
+            •	Testbench is provided for a 5-bit convolutional constraint length. In the testbench file parameter N can be set to some other value.
+            •	Review synthesis results (resource usage and RTL netlist/schematic) for N=5. 
+            •	Review input and output signals in simulation waveform.
+            •	Assume below mentioned primary port names and SystemVerilog RTL module name lfsr. 
+
+        About Convolutional Encoder :
+            	It is like an LFSR, but has data in and data out, rather than any feedback.
+                o	For rate ½, we generate two output bits for every input bit, once per clock cycle
+                o	It requires very little hardware – build it from simple shift-registers with bitwise AND and reduction xor.
+                    	N-bit conv. enc. would require N-1 internal flip-flops
+            	A convolutional encocer is type of a shift register which performs the following steps:
+                o	Masks a sequence using a row of 2-input AND gates
+                    	each AND[i] outputs MASK[i] & Shift_Reg_Tap[i]
+                o	This is done twice in parallel for rate ½
+                o	Does a reduction XOR of the outputs of these AND gates
+                    	Do this twice, once per set of ANDs and tap patterns
+                    	Outputs these reduction XOR results
+                o	Shifts the bits in the shift register one position to the right (in our application) 
+                o	Replaces the vacated bit with the value at the data input port
+    </input_spec>
+    <module>
+        module conv_enc #(parameter N = 6)( // N = shift reg. length
+            input               clk,
+                                data_in,
+                                reset,
+            input       [  1:0] load_mask,  // 1: load mask0 pattern; 2: load mask1
+            input       [N-1:0] mask,       // mask pattern to be loaded; prepend with 1  
+            output logic[  1:0] data_out);  // encoded data out
+
+
+            /* fill in the guts.
+            Hint: You need to build two parallel single-bit shift registers
+            and AND/XOR networks. Build two indepenent single-bit encoders in paralle.
+            */
+            logic [N-1:0] shift_reg, mask_q0, mask_q1;
+
+
+            always_ff @( posedge clk, negedge reset ) begin : seq
+                if (~reset) begin
+                shift_reg <= 0;
+            end
+            else begin
+                if (load_mask == 0)
+                    shift_reg <= {data_in, shift_reg[N-1:1]};
+                else begin
+                    shift_reg <= shift_reg;
+                    if (load_mask[1])
+                        mask_q1 <= mask;
+                    if (load_mask[0])
+                        mask_q0 <= mask;
+                end
+            end
+
+
+            wire [N-1:0] inter0, inter1;
+
+
+            assign inter0 = mask_q0 & shift_reg;
+            assign inter1 = mask_q1 & shift_reg;
+    </module>
+</example>
+"""

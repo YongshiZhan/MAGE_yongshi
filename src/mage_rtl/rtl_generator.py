@@ -5,7 +5,7 @@ from llama_index.core.base.llms.types import ChatMessage, ChatResponse, MessageR
 from pydantic import BaseModel
 
 from .log_utils import get_logger
-from .prompts import FAILED_TRIAL_PROMPT, ORDER_PROMPT, RTL_4_SHOT_EXAMPLES
+from .prompts import FAILED_TRIAL_PROMPT, ORDER_PROMPT, RTL_4_SHOT_EXAMPLES, WRONG_RTL_2_SHOT_EXAMPLES
 from .sim_reviewer import check_syntax
 from .token_counter import TokenCounter, TokenCounterCached
 from .utils import add_lineno
@@ -16,8 +16,39 @@ SYSTEM_PROMPT = r"""
 You are an expert in RTL design. You can always write SystemVerilog code with no syntax errors and always reach correct functionality.
 """
 
+WRONG_RTL_SYSTEM_PROMPT = r"""
+You are an junior RTL designer. You can always write SystemVerilog code with no syntax errors but can produce functionally incorrect design.
+"""
+
 GENERATION_PROMPT = r"""
 Please write a module in SystemVerilog RTL language regarding to the given natural language specification.
+Try to understand the requirements above and give reasoning steps in natural language to achieve it.
+In addition, try to give advice to avoid syntax error.
+An SystemVerilog RTL module always starts with a line starting with the keyword 'module' followed by the module name.
+It ends with the keyword 'endmodule'.
+
+[Hints]:
+For implementing kmap (Karnaugh map), you need to think step by step.
+Carefully example how the kmap in input_spec specifies the order of the inputs.
+Note that x[i] in x[N:1] means x[i-1] in x[N-1:0].
+Then find the inputs corresponding to output=1, 0, and don't-care for each case.
+
+Note in Verilog, for a signal "logic x[M:N]" where M > N, you CANNOT reversely select bits from it like x[1:2];
+Instead, you should use concatations like {{x[1], x[2]}}.
+
+The module interface should EXACTLY MATCH module_interface if given.
+Otherwise, should EXACTLY MATCH with the description in input_spec.
+(Including the module name, input/output ports names, and their types)
+
+
+{examples_prompt}
+<input_spec>
+{input_spec}
+</input_spec>
+"""
+
+WRONG_RTL_GENERATION_PROMPT = r"""
+Please write a module in SystemVerilog RTL language to demonstrate some common functional errors regarding to the given natural language specification.
 Try to understand the requirements above and give reasoning steps in natural language to achieve it.
 In addition, try to give advice to avoid syntax error.
 An SystemVerilog RTL module always starts with a line starting with the keyword 'module' followed by the module name.
@@ -319,3 +350,37 @@ class RTLGenerator:
                 self.get_format_error_prompt_messages(syntax_output, rtl_code)
             )
         return (syntax_correct, rtl_code)
+    
+class WrongRTLGen(RTLGenerator):
+    def get_init_prompt_messages(self, input_spec: str) -> List[ChatMessage]:
+        ret = [
+            ChatMessage(content=WRONG_RTL_SYSTEM_PROMPT, role=MessageRole.SYSTEM),
+            ChatMessage(
+                content=WRONG_RTL_GENERATION_PROMPT.format(
+                    input_spec=input_spec, examples_prompt=WRONG_RTL_2_SHOT_EXAMPLES
+                ),
+                role=MessageRole.USER,
+            ),
+        ]
+        if self.generated_tb:
+            ret.append(
+                ChatMessage(
+                    content=TB_PROMPT.format(testbench=self.generated_tb),
+                    role=MessageRole.USER,
+                )
+            )
+        if self.failed_trial:
+            ret.extend(self.failed_trial)
+        if self.generated_if:
+            ret.append(
+                ChatMessage(
+                    content=IF_PROMPT.format(module_interface=self.generated_if),
+                    role=MessageRole.USER,
+                )
+            )
+        if (
+            isinstance(self.token_counter, TokenCounterCached)
+            and self.token_counter.enable_cache
+        ):
+            self.token_counter.add_cache_tag(ret[-1])
+        return ret
